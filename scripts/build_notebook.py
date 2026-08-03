@@ -134,7 +134,154 @@ print("Desviacion escalada de train:", np.round(data.X_train_scaled.std(axis=0),
     md("""
 ## 4. Investigacion de componentes de PyTorch
 
-Las siguientes secciones incorporaran la investigacion de capas, funciones de perdida y optimizadores, seguida del modelo configurable y los 17 experimentos.
+### Capas y activaciones
+
+| Componente | Proposito y parametros relevantes |
+|---|---|
+| `nn.Linear(in_features, out_features, bias)` | Transformacion afin `y=xA^T+b`; conecta cada neurona con la capa siguiente. `in_features` y `out_features` definen dimensiones y `bias` controla el termino independiente. |
+| `nn.ReLU(inplace)` | Aplica `max(0,x)`. Es barata y reduce el problema de gradientes que se desvanecen, aunque una neurona puede quedar inactiva. |
+| `nn.LeakyReLU(negative_slope, inplace)` | Conserva una pendiente pequena para valores negativos; `negative_slope=0.01` evita gradiente exactamente cero. |
+| `nn.Tanh()` | Comprime a `[-1,1]` y centra las activaciones, pero puede saturarse y reducir el gradiente. |
+| `nn.Dropout(p)` | Durante entrenamiento anula aleatoriamente una fraccion `p`; en evaluacion se desactiva. Reduce coadaptacion y overfitting. |
+| `nn.BatchNorm1d(num_features, eps, momentum)` | Normaliza activaciones por feature en minibatches y mantiene estadisticas moviles para evaluacion. Puede estabilizar y acelerar entrenamiento. |
+
+Fuente: [API oficial de torch.nn](https://docs.pytorch.org/docs/stable/nn.html).
+
+### Perdidas de regresion
+
+| Perdida | Interpretacion |
+|---|---|
+| `nn.MSELoss(reduction)` | Promedia errores al cuadrado. Penaliza con fuerza errores grandes y es la funcion objetivo principal del laboratorio. |
+| `nn.L1Loss(reduction)` | Promedia errores absolutos. Es mas robusta ante valores extremos, pero su gradiente no es suave en cero. |
+| `nn.SmoothL1Loss(beta, reduction)` | Combina comportamiento cuadratico cerca de cero y lineal para errores grandes; `beta` controla la transicion. |
+
+Las tres aceptan `reduction='mean'`, `'sum'` o `'none'`. MSE de entrenamiento no debe confundirse con RMSE: RMSE es la raiz de MSE y vuelve a las unidades del target.
+
+### Optimizadores y regularizacion
+
+| Optimizador | Funcion y diferencia principal |
+|---|---|
+| `SGD(params, lr, momentum, weight_decay)` | Actualiza en direccion contraria al gradiente. Momentum acumula direccion y reduce oscilaciones; suele requerir mayor ajuste de `lr`. |
+| `Adam(params, lr, betas, eps, weight_decay)` | Adapta el paso por parametro usando momentos de primer y segundo orden. Suele converger rapido y es el baseline. |
+| `RMSprop(params, lr, alpha, eps, weight_decay)` | Divide el gradiente por una media movil de gradientes cuadrados; `alpha` controla la memoria del acumulador. |
+
+`lr` determina el tamano del paso: demasiado alto puede oscilar o divergir y demasiado bajo vuelve lento el aprendizaje. `weight_decay` agrega regularizacion L2 en estos optimizadores. La regularizacion L1 se incorpora explicitamente a la funcion objetivo. Fuente: [API oficial de torch.optim](https://docs.pytorch.org/docs/stable/optim.html).
+"""),
+    md("""
+## 5. MLP configurable y estrategia experimental
+
+Cada bloque oculto sigue `Linear -> BatchNorm opcional -> activacion -> Dropout opcional`; la salida es una capa lineal de una neurona, apropiada para regresion sin restringir el rango. Todas las corridas reinician la semilla, usan el mismo split y conservan el checkpoint con menor RMSE de validacion.
+"""),
+    code("""
+from dataclasses import asdict
+from IPython.display import Markdown, display
+from src.experiments import (
+    RegressionMLP, experiment_catalog, plot_selected_curves,
+    retrain_and_test_once, run_experiments, save_artifacts, select_best,
+)
+
+configs = experiment_catalog()
+config_table = pd.DataFrame([asdict(config) for config in configs])
+assert len(config_table) == 17 and config_table["id"].is_unique
+display(config_table)
+
+shape_test = RegressionMLP(8, configs[0])(torch.zeros(5, 8))
+assert tuple(shape_test.shape) == (5,)
+print("Forma de salida validada:", tuple(shape_test.shape))
+"""),
+    md("""
+## 6. Entrenamiento de las 17 iteraciones
+
+La perdida comparable entre train y validacion es MSE. En L1 tambien se registra `train_objective`, que suma la penalizacion a MSE. El conjunto de test no se pasa a `run_experiments` y permanece aislado.
+"""),
+    code("""
+results, histories, states = run_experiments(
+    configs,
+    data.X_train_scaled,
+    data.y_train.to_numpy(dtype=np.float32),
+    data.X_val_scaled,
+    data.y_val.to_numpy(dtype=np.float32),
+)
+
+summary_columns = [
+    "id", "name", "architecture", "activation", "optimizer", "learning_rate",
+    "batch_size", "epochs", "regularization", "best_epoch", "val_mse",
+    "val_mae", "val_rmse", "training_seconds",
+]
+display(results[summary_columns].round(5))
+"""),
+    md("""
+## 7. Curvas, seleccion y diagnostico
+
+Se muestran baseline, mejor, peor y la corrida con mayor brecha MSE de validacion-entrenamiento. Una brecha creciente sugiere overfitting; perdidas altas y cercanas sugieren underfitting.
+"""),
+    code("""
+best = select_best(results)
+curve_ids = plot_selected_curves(results, histories, FIGURES / "curvas_seleccionadas.png")
+plt.show()
+display(best[summary_columns].to_frame("mejor_configuracion"))
+print("Curvas graficadas:", curve_ids)
+"""),
+    md("""
+## 8. Evaluacion final sobre test - una sola vez
+
+Solo despues de fijar la configuracion ganadora se combinan train y validacion, se reajusta el scaler con ese conjunto y se reentrena durante el mejor epoch observado. Entonces se evalua test una unica vez.
+"""),
+    code("""
+best_config = next(config for config in configs if config.id == int(best["id"]))
+X_train_val = pd.concat([data.X_train, data.X_val]).sort_index()
+y_train_val = pd.concat([data.y_train, data.y_val]).sort_index()
+
+final_metrics, final_scaler, final_state = retrain_and_test_once(
+    best_config,
+    int(best["best_epoch"]),
+    X_train_val,
+    y_train_val,
+    data.X_test,
+    data.y_test,
+)
+save_artifacts(ARTIFACTS, results, histories, best, final_metrics)
+
+display(pd.DataFrame({
+    "metrica": ["MSE", "MAE", "RMSE", "MAE aproximado (USD)", "RMSE aproximado (USD)"],
+    "test": [final_metrics["mse"], final_metrics["mae"], final_metrics["rmse"], final_metrics["mae_usd"], final_metrics["rmse_usd"]],
+}))
+"""),
+    md("""
+## 9. Discusion y conclusiones basadas en resultados
+
+La siguiente celda produce una sintesis usando exclusivamente validacion para comparar configuraciones y reserva test para estimar generalizacion final.
+"""),
+    code("""
+baseline = results.loc[results.id == 1].iloc[0]
+best_regularized = results.loc[results.regularization != "Ninguna"].sort_values("val_rmse").iloc[0]
+worst = results.sort_values("val_rmse", ascending=False).iloc[0]
+largest_gap = results.sort_values("generalization_gap", ascending=False).iloc[0]
+batch_rows = results.loc[results.id.isin([10, 11])].sort_values("batch_size")
+epoch_rows = results.loc[results.id.isin([12, 13])].sort_values("epochs")
+
+discussion = f'''
+### Hallazgos
+
+1. **Mayor impacto positivo y negativo.** La mejor validacion fue E{int(best.id)} ({best['name']}) con RMSE {best.val_rmse:.4f}, una variacion de {(best.val_rmse-baseline.val_rmse):+.4f} frente al baseline. El peor resultado fue E{int(worst.id)} ({worst['name']}) con RMSE {worst.val_rmse:.4f}.
+2. **Overfitting/underfitting.** La mayor brecha en su mejor epoch aparecio en E{int(largest_gap.id)} ({largest_gap['name']}), con `val_mse-train_mse={largest_gap.generalization_gap:.4f}`. Las curvas permiten distinguir brecha creciente (overfitting) de perdidas altas y similares (underfitting).
+3. **Regularizacion.** La mejor variante regularizada fue E{int(best_regularized.id)} ({best_regularized.regularization}), RMSE {best_regularized.val_rmse:.4f}; frente al baseline el cambio fue {(best_regularized.val_rmse-baseline.val_rmse):+.4f}. Dropout introduce ruido, L1 favorece pesos pequenos o cero y L2 penaliza suavemente magnitudes grandes.
+4. **Batch size y epochs.** Batch 32 y 256 tardaron {batch_rows.iloc[0].training_seconds:.1f}s y {batch_rows.iloc[1].training_seconds:.1f}s, respectivamente. Batches pequenos generan mas actualizaciones y ruido; grandes producen gradientes mas estables. Las corridas de 50 y 150 epochs muestran el intercambio entre tiempo, convergencia y posible sobreajuste.
+5. **MSE, MAE y RMSE.** MSE amplifica errores grandes y queda en unidades cuadradas; MAE describe el error absoluto tipico y es mas robusta; RMSE conserva la penalizacion cuadratica pero vuelve a unidades de USD 100,000. En test: MSE={final_metrics['mse']:.4f}, MAE={final_metrics['mae']:.4f} y RMSE={final_metrics['rmse']:.4f}.
+6. **Eleccion de produccion.** Se elegiria la arquitectura y los hiperparametros de E{int(best.id)}, acompañados de validacion cruzada o busqueda bayesiana, monitoreo de drift, analisis geoespacial del error y una estrategia explicita para el target censurado.
+
+### Conclusion
+
+La comparacion controlada muestra que el rendimiento no depende solo del tamano de la red: escala de entradas, optimizador, tasa de aprendizaje, regularizacion y tiempo de entrenamiento interactuan. El test final se consulto una vez y obtuvo RMSE aproximado de USD {final_metrics['rmse_usd']:,.0f} y MAE aproximado de USD {final_metrics['mae_usd']:,.0f}. Estos valores deben interpretarse considerando el techo de `MedHouseVal` y que un split aleatorio no evalua por completo generalizacion geografica o temporal.
+'''
+display(Markdown(discussion))
+"""),
+    md("""
+## Referencias
+
+- Scikit-learn. *California housing dataset*. https://scikit-learn.org/stable/modules/generated/sklearn.datasets.fetch_california_housing.html
+- PyTorch. *torch.nn API*. https://docs.pytorch.org/docs/stable/nn.html
+- PyTorch. *torch.optim API*. https://docs.pytorch.org/docs/stable/optim.html
 """),
 ]
 
