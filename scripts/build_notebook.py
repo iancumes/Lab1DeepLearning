@@ -254,7 +254,7 @@ La siguiente celda produce una sintesis usando exclusivamente validacion para co
 """),
     code("""
 baseline = results.loc[results.id == 1].iloc[0]
-best_regularized = results.loc[results.regularization != "Ninguna"].sort_values("val_rmse").iloc[0]
+best_regularized = results.loc[results.id.isin([14, 15, 16])].sort_values("val_rmse").iloc[0]
 worst = results.sort_values("val_rmse", ascending=False).iloc[0]
 largest_gap = results.sort_values("generalization_gap", ascending=False).iloc[0]
 batch_rows = results.loc[results.id.isin([10, 11])].sort_values("batch_size")
